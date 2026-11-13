@@ -1,0 +1,251 @@
+module top_calculator_max7219 (
+    input  logic         clk,          // Системний клок 50 МГц
+    input  logic         rst_n,        // Асинхронний скид (активний 0)
+    
+    // Інтерфейс клавіатури
+    input  logic         key_valid,    // Строб натискання цифри/операції (1 такт clk)
+    input  logic [3:0]   key_code,     // 0-9: цифри, 4'hA: ., 4'hB: С, 4'hC: +, 4'hD: -, 4'hE: *, 4'hF: /
+    input  logic         key_equal,    // Окремий строб для кнопки "Равно" (=) (1 такт clk)
+    
+    // Виходи на драйвер дисплея MAX7219 (SPI шина)
+    output logic         max7219_clk,  
+    output logic         max7219_data, 
+    output logic         max7219_load  
+);
+
+    // --- Внутрішні шини зв'язку ---
+    logic signed [39:0] typed_value;
+    logic               typed_valid;
+    logic signed [39:0] reg_a;
+    logic signed [39:0] reg_b;
+    logic [1:0]         reg_op;        // Регістр зберігання обраної операції
+    logic               calc_start;
+    logic               calc_ready;
+    logic signed [39:0] calc_result_bus;
+
+    // --- Сигнали для блоку конвертації в BCD ---
+    logic [23:0]        abs_int;
+    logic [15:0]        frac_part;
+    logic               is_negative;
+    logic [39:0]        abs_res;       
+
+    // --- Керуючий автомат (FSM) класичного калькулятора ---
+    typedef enum logic [1:0] {
+        INPUT_OP_A,   // Введення першого числа
+        INPUT_OP_B,   // Введення другого числа
+        SHOW_RESULT   // Відображення результату обчислень
+    } state_t;
+    state_t current_state;
+
+    // Прапорець для примусового очищення модуля введення при зміні етапів
+    logic clear_input_acc;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            reg_a           <= '0;
+            reg_b           <= '0;
+            reg_op          <= '0;
+            calc_start      <= 1'b0;
+            clear_input_acc <= 1'b0;
+            current_state   <= INPUT_OP_A;
+        end else begin
+            calc_start      <= 1'b0;
+            clear_input_acc <= 1'b0;
+
+            // Глобальне скидання на кнопку 'C' (4'hB)
+            if (key_valid && key_code == 4'hB) begin
+                reg_a           <= '0;
+                reg_b           <= '0;
+                reg_op          <= '0;
+                clear_input_acc <= 1'b1;
+                current_state   <= INPUT_OP_A;
+            end else begin
+                case (current_state)
+                    
+                    // 1. Введення першого числа (Операнд А)
+                    INPUT_OP_A: begin
+                        // Якщо натиснуто кнопку операції (+, -, *, /), фіксуємо А
+                        if (key_valid && key_code >= 4'hC) begin
+                            reg_a           <= typed_value;   // Зберігаємо введене число А
+                            reg_op          <= key_code[1:0]; // Запам'ятовуємо операцію (C->00, D->01, E->10, F->11)
+                            clear_input_acc <= 1'b1;          // Очищуємо накопичувач для введення числа В
+                            current_state   <= INPUT_OP_B;
+                        end
+                    end
+
+                    // 2. Введення другого числа (Операнд В)
+                    INPUT_OP_B: begin
+                        // Чекаємо кнопку "Равно" (=)
+                        if (key_equal) begin
+                            reg_b           <= typed_value;   // Зберігаємо введене число В
+                            calc_start      <= 1'b1;          // Запускаємо ядро обчислень
+                            clear_input_acc <= 1'b1;          // Готуємо модуль введення до наступних сесій
+                            current_state   <= SHOW_RESULT;
+                        end
+                    end
+
+                    // 3. Результат на екрані
+                    SHOW_RESULT: begin
+                        // Якщо користувач натискає цифру або точку — починаємо нове введення А
+                        if (key_valid && (key_code <= 4'd9 || key_code == 4'hA)) begin
+                            reg_a           <= '0;
+                            reg_b           <= '0;
+                            current_state   <= INPUT_OP_A;
+                        end
+                    end
+                    
+                    default: current_state <= INPUT_OP_A;
+                endcase
+            end
+        end
+    end
+
+    // --- Мультиплексор значень екрана ---
+    logic signed [39:0] active_value;
+    always_comb begin
+        if (current_state == SHOW_RESULT) begin
+            active_value = calc_result_bus;     // Показуємо результат обчислень
+        end else begin
+            active_value = typed_value;         // Показуємо поточний набір (для А або для В)
+        end
+    end
+
+    // --- Блок конвертації Fixed-Point (Q24.16) в BCD ---
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            abs_int     <= '0;
+            frac_part   <= '0;
+            is_negative <= 1'b0;
+            abs_res     <= '0;
+        end else begin
+            is_negative <= active_value; // Знак числа — це його старший 39-й біт
+            
+            if (active_value == 1'b1) begin // Якщо число від'ємне — беремо його модуль (абсолютне значення)
+                abs_res   = -active_value;
+                abs_int   = abs_res[39:16];
+                frac_part = abs_res[15:0];
+            end else begin
+                abs_int   = active_value[39:16];
+                frac_part = active_value[15:0];
+            end
+        end
+    end
+
+    // Крок 1: Конвертація 3 знаків дробу за алгоритмом Double Dabble (*1000)
+    logic [11:0] bcd_frac;
+    always_comb begin
+        logic [11:0] bcd;
+        logic [15:0] val;
+        bcd = '0;
+        val = 16'((frac_part * 16'd1000) >> 16); 
+        for (int i = 0; i < 12; i++) begin
+            if (bcd[3:0]  >= 5) bcd[3:0]  = bcd[3:0]  + 4'd3;
+            if (bcd[7:4]  >= 5) bcd[7:4]  = bcd[7:4]  + 4'd3;
+            if (bcd[11:8] >= 5) bcd[11:8] = bcd[11:8] + 4'd3;
+            bcd = {bcd[10:0], val}; val = {val[14:0], 1'b0};
+        end
+        bcd_frac = bcd;
+    end
+
+    // Крок 2: Конвертація 5 знаків цілої частини в BCD
+    logic [19:0] bcd_int;
+    always_comb begin
+        logic [19:0] bcd;
+        logic [23:0] val;
+        bcd = '0; 
+        val = abs_int;
+        for (int i = 0; i < 24; i++) begin
+            for (int j = 0; j < 5; j++) begin
+                if (bcd[j*4 +: 4] >= 5) bcd[j*4 +: 4] = bcd[j*4 +: 4] + 4'd3;
+            end
+            bcd = {bcd[18:0], val}; val = {val[22:0], 1'b0};
+        end
+        bcd_int = bcd;
+    end
+
+    // Крок 3: Інтелектуальне пакування 32-бітної BCD шини (Гасіння нулів та зсув мінуса)
+    logic [31:0] bcd_parallel_bus;
+    logic [3:0]  disp_dig7, disp_dig6, disp_dig5, disp_dig4, disp_dig3;
+
+    always_comb begin
+        // Спочатку копіюємо отримані цифри з BCD конвертера
+        disp_dig7 = bcd_int[19:16]; // Десятки тисяч
+        disp_dig6 = bcd_int[15:12]; // Тисячі
+        disp_dig5 = bcd_int[11:8];  // Сотні
+        disp_dig4 = bcd_int[7:4];   // Десятки
+        disp_dig3 = bcd_int[3:0];   // Одиниці (їх ніколи не гасимо, навіть якщо це 0)
+
+        // Каскадний алгоритм гасіння ведучих нулів (4'h0 у hex2seg поверне пустий розряд)
+        if (disp_dig7 == 4'd0) begin
+            disp_dig7 = 4'h0; 
+            if (disp_dig6 == 4'd0) begin
+                disp_dig6 = 4'h0; 
+                if (disp_dig5 == 4'd0) begin
+                    disp_dig5 = 4'h0; 
+                    if (disp_dig4 == 4'd0) begin
+                        disp_dig4 = 4'h0; 
+                    end
+                end
+            end
+        end
+
+        // Якщо число від'ємне, посуваємо знак мінуса (4'hF) впритул до першої значущої цифри
+        if (is_negative) begin
+            if (bcd_int[19:16] != 4'd0) begin
+                disp_dig7 = 4'hF; // Мінус затирає старший розряд у разі екстремального числа
+            end else if (bcd_int[15:12] != 4'd0) begin
+                disp_dig7 = 4'hF; 
+            end else if (bcd_int[11:8] != 4'd0) begin
+                disp_dig6 = 4'hF; 
+            end else if (bcd_int[7:4] != 4'd0) begin
+                disp_dig5 = 4'hF; 
+            end else begin
+                disp_dig4 = 4'hF; // Мінус стає безпосередньо перед одиницями
+            end
+        end
+
+        // Пакуємо підготовлені символи у фінальну шину SPI дисплея
+        bcd_parallel_bus[31:28] = disp_dig7; 
+        bcd_parallel_bus[27:24] = disp_dig6;
+        bcd_parallel_bus[23:20] = disp_dig5;
+        bcd_parallel_bus[19:16] = disp_dig4;
+        bcd_parallel_bus[15:12] = disp_dig3;      // Розряд перед крапкою (Одиниці)
+        bcd_parallel_bus[11:8]  = bcd_frac[11:8];  // Десяті
+        bcd_parallel_bus[7:4]   = bcd_frac[7:4];   // Соті
+        bcd_parallel_bus[3:0]   = bcd_frac[3:0];   // Тисячні
+    end
+
+
+    // --- ПІДКЛЮЧЕННЯ ПІДМОДУЛІВ ПРОЄКТУ ---
+
+    // 1. Модуль послідовного десяткового введення чисел з клавіатури
+    q24_16_input_dec u_input (
+        .clk        (clk),
+        .rst_n      (rst_n & ~clear_input_acc), // Скидаємо накопичувач при зміні станів FSM калькулятора
+        .key_valid  (key_valid),
+        .key_code   (key_code),
+        .q_value    (typed_value),
+        .q_valid    (typed_valid)
+    );
+
+    // 2. Обчислювальне ядро калькулятора (+, -, *, /)
+    q24_16_calculator u_calculator (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .a          (reg_a),
+        .b          (reg_b),
+        .op         (reg_op), // Передаємо сюди збережену команду з клавіатури
+        .start      (calc_start),
+        .ready      (calc_ready),
+        .result_out (calc_result_bus)
+    );
+
+    // 3. SPI Драйвер дисплея MAX7219
+    M7219_FixedPoint u_spi_display (
+        .clk        (clk),
+        .parallel   (bcd_parallel_bus),
+        .dot_pos    (3'd3), // Крапка жорстко зафіксована після одиниць (3-й розряд з кінця)
+        .clk_out    (max7219_clk),
+        .data_out   (max7219_data),
+        .load       (max7219_load));
+endmodule

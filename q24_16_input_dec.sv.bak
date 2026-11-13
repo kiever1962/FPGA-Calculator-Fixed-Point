@@ -1,0 +1,134 @@
+module q24_16_input_dec (
+    input  logic         clk,           // Системный клок (например, 50 МГц)
+    input  logic         rst_n,         // Асинхронный сброс (активный 0)
+    
+    // Интерфейс клавиатуры (импульс в 1 такт clk при нажатии)
+    input  logic         key_valid,     // Флаг нажатия любой клавиши
+    input  logic [3:0]   key_code,      // 0-9: Цифры, 4'hA: Точка (.), 4'hB: Очистить (C), 4'hC: Ввод (Enter)
+    
+    output logic signed [39:0] q_value, // Выходное число в формате signed Q24.16
+    output logic         q_valid        // Строб готовности нового числа на выходе
+);
+
+    // Ограничения для предотвращения переполнения при вводе:
+    // Q24.16 макс. целая часть ~16.7 млн (7 знаков). Дробная часть — возьмем 3 знака после точки.
+    localparam int MAX_INT_DIGITS  = 7;
+    localparam int MAX_FRAC_DIGITS = 3;
+
+    // Регистры для хранения введенных чисел в обычном Integer (для простоты умножения на 10)
+    logic [31:0] int_accumulator;
+    logic [31:0] frac_accumulator;
+    
+    logic [2:0]  frac_digit_cnt; // Счетчик введенных цифр после точки
+    logic        dot_pressed;     // Флаг того, что точка уже была нажата
+
+    // --- Состояния автомата конвертации ---
+    typedef enum logic [1:0] {IDLE, CONVERT_FRAC, CONVERT_FINAL, DONE} state_t;
+    state_t state;
+
+    // Временные регистры для вычислений
+    logic [63:0] frac_scaled;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            int_accumulator  <= '0;
+            frac_accumulator <= '0;
+            frac_digit_cnt   <= '0;
+            dot_pressed      <= 1'b0;
+            q_value          <= '0;
+            q_valid          <= 1'b0;
+            frac_scaled      <= '0;
+            state            <= IDLE;
+        end else begin
+            q_valid <= 1'b0; // Пульс готовности держится 1 такт
+
+            case (state)
+                IDLE: begin
+                    if (key_valid) begin
+                        case (key_code)
+                            // Кнопка очистки (Clear / C)
+                            4'hB: begin
+                                int_accumulator  <= '0;
+                                frac_accumulator <= '0;
+                                frac_digit_cnt   <= '0;
+                                dot_pressed      <= 1'b0;
+                            end
+                            
+                            // Кнопка "Точка" (.)
+                            4'hA: begin
+                                dot_pressed <= 1'b1;
+                            end
+                            
+                            // Кнопка "Ввод" (Enter) -> Запуск конвертации в Q24.16
+                            4'hC: begin
+                                if (int_accumulator != '0 || frac_accumulator != '0) begin
+                                    state <= CONVERT_FRAC;
+                                end
+                            end
+                            
+                            // Цифры 0-9
+                            default: begin
+                                if (key_code <= 4'd9) begin
+                                    if (!dot_pressed) begin
+                                        // Ввод целой части (ограничение по знакам)
+                                        if (int_accumulator < 32'd1000000) begin
+                                            int_accumulator <= (int_accumulator * 32'd10) + key_code;
+                                        end
+                                    end else begin
+                                        // Ввод дробной части (ограничение до 3 знаков)
+                                        if (frac_digit_cnt < MAX_FRAC_DIGITS) begin
+                                            frac_accumulator <= (frac_accumulator * 32'd10) + key_code;
+                                            frac_digit_cnt   <= frac_digit_cnt + 1'b1;
+                                        end
+                                    end
+                                end
+                            end
+                        endcase
+                    end
+                end
+
+                // Шаг 1: Конвертация дробной части.
+                // Формула: (frac * 65536) / 10^frac_digit_cnt. 
+                // Чтобы не строить сложный динамический делитель, приведем все к 3 знакам (тысячным долям).
+                CONVERT_FRAC: begin
+                    logic [31:0] norm_frac;
+                    norm_frac = frac_accumulator;
+                    
+                    // Если ввели 1 знак (например .5), превращаем в .500
+                    if (frac_digit_cnt == 3'd1) norm_frac = frac_accumulator * 32'd100;
+                    // Если ввели 2 знака (например .51), превращаем в .510
+                    else if (frac_digit_cnt == 3'd2) norm_frac = frac_accumulator * 32'd10;
+                    
+                    // Умножаем нормализованную дробь на 2^16 (65536)
+                    frac_scaled <= 64'(norm_frac) << 16;
+                    state       <= CONVERT_FINAL;
+                end
+
+                // Шаг 2: Финальный расчет. Делим дробную часть на 1000 и прибавляем целую часть
+                // Деление на константу 1000 отлично оптимизируется синтезатором (Quartus/Vivado) 
+                // через умножение на обратную величину (сложение и сдвиги).
+                CONVERT_FINAL: begin
+                    logic [31:0] final_frac;
+                    // Исправленный вариант: приведение жестко к 32 битам
+                    final_frac = 32'(frac_scaled / 32'd1000);
+
+                    
+                    // Сдвигаем целую часть на 16 бит влево (умножаем на 65536) и добавляем дробь
+                    q_value <= (int_accumulator << 16) + final_frac;
+                    state   <= DONE;
+                end
+
+                // Шаг 3: Выдача строба готовности и сброс аккумуляторов ввода
+                DONE: begin
+                    q_valid          <= 1'b1;
+                    int_accumulator  <= '0;
+                    frac_accumulator <= '0;
+                    frac_digit_cnt   <= '0;
+                    dot_pressed      <= 1'b0;
+                    state            <= IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule

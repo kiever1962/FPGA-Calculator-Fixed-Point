@@ -1,0 +1,39 @@
+module debounce (
+    input  wire clk,        // Системная частота (50 МГц)
+    input  wire rst_n,      // Сброс (активный низкий)
+    input  wire in_raw,     // Нестабильный входной сигнал кнопки
+    output reg  out_clean   // Очищенный от дребезга сигнал
+);
+
+    // Параметры для фильтрации 20 мс при 50 МГц (50,000,000 * 0.02 = 1,000,000 тактов)
+    localparam CTR_MAX = 20'd1000000;
+
+    reg [19:0] counter;
+    reg        sync_0, sync_1; // Двухкаскадный триггер для синхронизации асинхронного входа
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sync_0    <= 1'b0;
+            sync_1    <= 1'b0;
+            counter   <= 20'b0;
+            out_clean <= 1'b0;
+        end else begin
+            // Защита от метастабильности
+            sync_0 <= in_raw;
+            sync_1 <= sync_0;
+
+            // Если состояние изменилось, сбрасываем счетчик
+            if (sync_1 != out_clean) begin
+                counter <= counter + 1'b1;
+                // Если сигнал стабилен в течение 20 мс, фиксируем новое состояние
+                if (counter >= CTR_MAX) begin
+                    out_clean <= sync_1;
+                    counter   <= 20'b0;
+                end
+            end else begin
+                counter <= 20'b0; // Сброс счетчика, если сигнал совпадает со стабильным
+            end
+        end
+    end
+
+endmodule

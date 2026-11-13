@@ -1,0 +1,174 @@
+module M7219_FixedPoint (
+    input  logic        clk,         // Вхідна частота 50 МГц
+    input  logic [31:0] parallel,    // 8 цифр BCD (кожна по 4 біти)
+    input  logic [2:0]  dot_pos,     // Позиція крапки (3 для нашого калькулятора)
+    output logic        clk_out,     // Вихід SPI Clock
+    output logic        data_out,    // Вихід SPI Data
+    output logic        load         // Вихід SPI Latch / CS
+);
+
+    typedef enum logic [3:0] {
+        init_1, init_2, init_3, init_4, read_data,
+        dig_7, dig_6, dig_5, dig_4, dig_3, dig_2, dig_1, dig_0
+    } state_t;
+
+    typedef enum logic [2:0] {
+        idle, start, clk_data, clk_high, clk_low, finished
+    } driver_state_t;
+
+    state_t        state = init_1;
+    driver_state_t driver_state = idle;
+    
+    logic [15:0] command = 16'h0000;
+    logic [31:0] latch_in;
+    
+    logic [7:0]  dig0_data, dig1_data, dig2_data, dig3_data;
+    logic [7:0]  dig4_data, dig5_data, dig6_data, dig7_data;
+    
+    int counter = 0;
+    int clk_counter = 0;
+
+    // Знакогенератор HEX у 7-сегментний код (Common Cathode)
+    // Узгоджено з логікою топ-модуля: 4'hA - це МІНУС, 4'hF - це ПОРОЖНЬО (BLANK)
+    function automatic logic [7:0] hex2seg (input logic [3:0] num, input logic is_dot);
+        logic [7:0] seg_pattern;
+        case (num)
+            4'h0: seg_pattern = 8'b01111110; // '0'
+            4'h1: seg_pattern = 8'b00110000; // '1'
+            4'h2: seg_pattern = 8'b01101101; // '2'
+            4'h3: seg_pattern = 8'b01111001; // '3'
+            4'h4: seg_pattern = 8'b00110011; // '4'
+            4'h5: seg_pattern = 8'b01011011; // '5'
+            4'h6: seg_pattern = 8'b01011111; // '6'
+            4'h7: seg_pattern = 8'b01110000; // '7'
+            4'h8: seg_pattern = 8'b01111111; // '8'
+            4'h9: seg_pattern = 8'b01111011; // '9'
+            
+            // УЗГОДЖЕНО З ТОП-МОДУЛЕМ Калькулятора:
+            4'hA: seg_pattern = 8'b00000001; // Знак мінуса (-) 
+            4'hb: seg_pattern = 8'b00011111; // Символ 'b'
+            4'hc: seg_pattern = 8'b00001101; // Символ 'c'
+            4'hd: seg_pattern = 8'b00111101; // Символ 'd'
+            4'hE: seg_pattern = 8'b01001111; // Символ 'E'
+            
+            // УЗГОДЖЕНО З ТОП-МОДУЛЕМ Калькулятора (Гасіння нулів попереду):
+            4'hF: seg_pattern = 8'b00000000; // Повністю вимкнений розряд (BLANK)
+            
+            default: seg_pattern = 8'b00000000;
+        endcase
+        
+        // Якщо на цьому розряді потрібна крапка, піднімаємо біт 7 (DP)
+        return is_dot ? (seg_pattern | 8'b10000000) : seg_pattern;
+    endfunction
+	 
+    always_ff @(posedge clk) begin
+        case (state)
+            init_1: begin
+                if (driver_state == idle) begin
+                    command      <= 16'h0c01; // shutdown / normal operation
+                    driver_state <= start;
+                    state        <= init_2;
+                end
+            end
+            init_2: begin
+                if (driver_state == idle) begin
+                    command      <= 16'h0900; // decode mode (00 = пряме керування сегментами)
+                    driver_state <= start;
+                    state        <= init_3;
+                end
+            end
+            init_3: begin
+                if (driver_state == idle) begin
+                    command      <= 16'h0A02; // інтенсивність (яскравість)
+                    driver_state <= start;
+                    state        <= init_4;
+                end
+            end
+            init_4: begin
+                if (driver_state == idle) begin
+                    command      <= 16'h0B07; // scan limit (всі 8 цифр)
+                    driver_state <= start;
+                    state        <= read_data;
+                end
+            end
+            read_data: begin
+                latch_in  = parallel;
+                // Передаємо в знакогенератор цифру та прапорець крапки
+                dig7_data = hex2seg(latch_in[31:28], (dot_pos == 3'd7));
+                dig6_data = hex2seg(latch_in[27:24], (dot_pos == 3'd6));
+                dig5_data = hex2seg(latch_in[23:20], (dot_pos == 3'd5));
+                dig4_data = hex2seg(latch_in[19:16], (dot_pos == 3'd4));
+                dig3_data = hex2seg(latch_in[15:12], (dot_pos == 3'd3)); // Останній знак перед комою
+                dig2_data = hex2seg(latch_in[11:8],  (dot_pos == 3'd2)); // 1-й знак після коми
+                dig1_data = hex2seg(latch_in[7:4],   (dot_pos == 3'd1)); // 2-й знак після коми
+                dig0_data = hex2seg(latch_in[3:0],   (dot_pos == 3'd0)); // 3-й знак після коми
+                state     <= dig_7;
+            end
+            dig_7: begin
+                if (driver_state == idle) begin command <= {8'h08, dig7_data}; driver_state <= start; state <= dig_6; end
+            end
+            dig_6: begin
+                if (driver_state == idle) begin command <= {8'h07, dig6_data}; driver_state <= start; state <= dig_5; end
+            end
+            dig_5: begin
+                if (driver_state == idle) begin command <= {8'h06, dig5_data}; driver_state <= start; state <= dig_4; end
+            end
+            dig_4: begin
+                if (driver_state == idle) begin command <= {8'h05, dig4_data}; driver_state <= start; state <= dig_3; end
+            end
+            dig_3: begin
+                if (driver_state == idle) begin command <= {8'h04, dig3_data}; driver_state <= start; state <= dig_2; end
+            end
+            dig_2: begin
+                if (driver_state == idle) begin command <= {8'h03, dig2_data}; driver_state <= start; state <= dig_1; end
+            end
+            dig_1: begin
+                if (driver_state == idle) begin command <= {8'h02, dig1_data}; driver_state <= start; state <= dig_0; end
+            end
+            dig_0: begin
+                if (driver_state == idle) begin command <= {8'h01, dig0_data}; driver_state <= start; state <= read_data; end
+            end
+            default: state <= init_1;
+        endcase
+
+        // SPI Драйвер (Частота шини ~250 кГц при системних 50 МГц)
+        if (clk_counter < 100) begin
+            clk_counter <= clk_counter + 1;
+        end else begin
+            clk_counter <= 0;
+            case (driver_state)
+                idle: begin
+                    load    <= 1'b1;
+                    clk_out <= 1'b0;
+                end
+                start: begin
+                    load         <= 1'b0;
+                    counter      <= 16;
+                    driver_state <= clk_data;
+                end
+                clk_data: begin
+                    data_out     <= command[counter - 1]; 
+                    driver_state <= clk_high;
+                end
+                clk_high: begin
+                    clk_out      <= 1'b1;
+                    driver_state <= clk_low;
+                end
+                clk_low: begin
+                    clk_out <= 1'b0;
+                    if (counter == 1) begin 
+                        load         <= 1'b1;
+                        driver_state <= finished;
+                    end else begin
+                        counter      <= counter - 1;
+                        driver_state <= clk_data;
+                    end
+                end
+                finished: begin
+                    driver_state <= idle;
+                end
+                default: driver_state <= idle;
+            endcase
+        end
+    end
+endmodule

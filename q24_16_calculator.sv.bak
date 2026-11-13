@@ -1,0 +1,157 @@
+module q24_16_calculator (
+    input  logic         clk,          // Системний клок (наприклад, 50 МГц)
+    input  logic         rst_n,        // Асинхронний скид (активний 0)
+    input  logic signed [39:0] a,      // Операнд А (signed Q24.16)
+    input  logic signed [39:0] b,      // Операнд B (signed Q24.16)
+    input  logic [1:0]   op,           // 00: +, 01: -, 10: *, 11: /
+    input  logic         start,        // Імпульс старту обчислень (1 такт)
+    
+    output logic         ready,        // Флаг готовності результату (1 - готовий)
+    output logic signed [39:0] result_out // Вихідна шина результату для топ-модуля
+);
+
+    // --- Сигнали керування та внутрішніх обчислень ---
+    logic signed [39:0] calc_res;
+    logic               calc_ready;
+
+    // Сигнали для автомата ділення
+    logic [39:0] div_quotient;
+    logic        div_start;
+    logic        div_ready;
+
+    // --- Блок ділення (Послідовний автомат для signed Q24.16) ---
+    // Формат Q24.16 вимагає сдвигу діленого перед діленням на 16 біт вліво.
+    // Щоб уникнути переповнення під час зсуву, використовуємо 56-бітний чисельник.
+    logic [55:0] div_num;
+    logic [39:0] div_den;
+    logic        div_sign;
+    logic [5:0]  div_count;
+    logic [55:0] div_reg;
+    logic [39:0] div_out_abs;
+
+    typedef enum logic [1:0] {DIV_IDLE, DIV_CALC, DIV_DONE} div_state_t;
+    div_state_t div_state;
+
+    // Преобтворення знаків для беззнакового ділення модулів чисел
+    logic [39:0] abs_a, abs_b;
+    assign abs_a = (a[39] == 1'b1) ? -a : a;
+    assign abs_b = (b[39] == 1'b1) ? -b : b;
+
+    // Умова старту блоку ділення
+    assign div_start = (start && op == 2'b11 && div_state == DIV_IDLE);
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            div_state    <= DIV_IDLE;
+            div_reg      <= '0;
+            div_den      <= '0;
+            div_count    <= '0;
+            div_sign     <= 1'b0;
+            div_ready    <= 1'b0;
+            div_quotient <= '0;
+        end else begin
+            case (div_state)
+                DIV_IDLE: begin
+                    div_ready <= 1'b0;
+                    if (div_start) begin
+                        if (b == '0) begin // Захист від ділення на нуль
+                            div_quotient <= 40'h7FFFFFFFFF; // Максимальне позитивне число (Overflow)
+                            div_ready    <= 1'b1;
+                        end else begin
+                            div_reg   <= {16'b0, abs_a} << 16; // Масштабування Q24.16 під операцію ділення
+                            div_den   <= abs_b;
+                            div_sign  <= a[39] ^ b[39]; // Визначаємо знак майбутнього результату
+                            div_count <= 6'd40;         // Потрібно виконати 40 кроків ділення
+                            div_state <= DIV_CALC;
+                        end
+                    end
+                end
+
+                DIV_CALC: begin
+                    // Алгоритм ділення відновленням залишку (Restoring Division)
+                    logic [56:0] sub_res;
+                    sub_res = {div_reg[54:0], 1'b0} - {17'b0, div_den};
+                    
+                    if (sub_res[56] == 1'b0) begin // Віднімання успішне (результат позитивний)
+                        div_reg <= sub_res[55:0] | 56'b1;
+                    end else begin // Віднімання неуспішне (отримали мінус)
+                        div_reg <= {div_reg[54:0], 1'b0};
+                    end
+
+                    div_count <= div_count - 1'b1;
+                    if (div_count == 6'd1) begin
+                        div_state <= DIV_DONE;
+                    end
+                end
+
+                DIV_DONE: begin
+                    div_out_abs  = div_reg[39:0];
+                    div_quotient <= (div_sign) ? -div_out_abs : div_out_abs; // Повертаємо знак
+                    div_ready    <= 1'b1;
+                    div_state    <= DIV_IDLE;
+                end
+                
+                default: div_state <= DIV_IDLE;
+            endcase
+        end
+    end
+
+    // --- Основний автомат обчислень ядра калькулятора ---
+    // Операція знакового множення двох 40-бітних чисел дає 80-бітний результат
+    logic signed [79:0] full_mul;
+    assign full_mul = a * b; 
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            calc_res   <= '0;
+            calc_ready <= 1'b0;
+        end else begin
+            calc_ready <= 1'b0;
+            if (start) begin
+                case (op)
+                    2'b00: begin // 1. Складання (+)
+                        calc_res   <= a + b;
+                        calc_ready <= 1'b1;
+                    end
+                    2'b01: begin // 2. Віднімання (-)
+                        calc_res   <= a - b;
+                        calc_ready <= 1'b1;
+                    end
+                    2'b10: begin // 3. Множення (*) 
+                        // Для збереження формату Q24.16 відсікаємо молодші 16 біт дробу та старші зайві біти переповнення
+                        calc_res   <= full_mul[55:16];
+                        calc_ready <= 1'b1;
+                    end
+                    2'b11: begin // 4. Ділення (/)
+                        // Очікуємо завершення роботи послідовного автомата ділення
+                        if (div_ready) begin
+                            calc_res   <= div_quotient;
+                            calc_ready <= 1'b1;
+                        end
+                    end
+                    default: begin
+                        calc_res   <= '0;
+                        calc_ready <= 1'b0;
+                    end
+                endcase
+            end else if (op == 2'b11 && div_ready) begin // Перехоплення результату ділення, якщо старт вже пройшов
+                calc_res   <= div_quotient;
+                calc_ready <= 1'b1;
+            end
+        end
+    end
+
+    // --- Фіксація та стабілізація виходу пристрою ---
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            result_out <= '0; 
+            ready      <= 1'b0;
+        end else begin
+            ready <= calc_ready;
+            if (calc_ready) begin
+                result_out <= calc_res; 
+            end
+        end
+    end
+
+endmodule
